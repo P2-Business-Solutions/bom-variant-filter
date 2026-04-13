@@ -72,18 +72,37 @@ class MrpBom(models.Model):
 
     def _bom_has_applicable_lines(self, bom, product):
         """
-        Return True if at least one component line on `bom` is not skipped
-        for `product`.
+        Return True if at least one component line on `bom` applies to `product`.
 
-        A BOM with no lines at all returns False so it won't be selected as a
-        silent no-op over a better candidate.
+        Deliberately avoids _skip_bom_line() because in Odoo 18 that method
+        uses a domain condition on `raw_material_production_id` that requires
+        an active MO context. Called outside that context it silently ignores
+        the condition and returns False (not skipped) for every line, making
+        every BOM appear to have applicable lines regardless of variant filters.
+
+        Instead we check directly:
+          - If a line has no variant restrictions → it applies to all variants.
+          - If a line has variant restrictions → the product must carry all of
+            those attribute values (same logic Odoo uses internally).
+
+        A BOM with no lines returns False so it won't silently win over a
+        better candidate.
         """
         if not bom.bom_line_ids:
             return False
-        return any(
-            not line._skip_bom_line(product)
-            for line in bom.bom_line_ids
-        )
+
+        product_attr_values = product.product_template_attribute_value_ids
+
+        for line in bom.bom_line_ids:
+            line_restrictions = line.bom_product_template_attribute_value_ids
+            if not line_restrictions:
+                # No variant filter on this line — applies to every variant.
+                return True
+            if line_restrictions <= product_attr_values:
+                # All required attribute values are present on this product.
+                return True
+
+        return False
 
     def _find_fallback_bom(self, product, exclude_bom, picking_type, company_id, bom_type):
         """
