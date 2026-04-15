@@ -74,34 +74,53 @@ class MrpBom(models.Model):
 
     def _bom_has_applicable_lines(self, bom, product):
         """
-        Return True only if the BOM covers every component "role" it defines
-        for ``product``.
+        Return True only if the BOM plausibly covers every component "role"
+        it defines for ``product``.
 
         A naive "at least one line applies" check is too permissive for BOMs
-        that mix several component roles — e.g. a *Precut* BOM that contains
-        variant-restricted lens lines (Glass only), variant-restricted frame
-        lines, and generic packaging lines. For a PC variant, the frame line
-        and the packaging lines still apply, so the naive check incorrectly
-        reports the BOM as applicable even though the BOM has no lens line
-        that fits the variant and would produce an MO missing its lens.
+        that enumerate variants across an axis — e.g. a *Precut* BOM whose
+        lens lines span ``Lens Color ∈ {Blue Mirror, Green Mirror, Violet
+        Mirror, Rose Mirror}`` but are all ``Lens Material = Glass``. For a
+        PC variant, the frame line and the generic packaging lines still
+        apply, so the naive check reports the BOM as applicable even though
+        no lens line fits the variant and the resulting MO would be missing
+        its lens. ``_bom_find`` never falls through to the Raw BOM that has
+        the PC lens.
 
-        The real requirement is stronger: for every distinct combination of
-        attribute *axes* the BOM restricts lines on, at least one line in
-        that group must resolve for ``product``. In the example above the
-        BOM has three groups:
+        A naive "every attribute-axis group must have a matching line" check
+        is the other extreme — too strict. It breaks the equally common
+        pattern of *optional* variant-specific lines (e.g. a logo sticker
+        present only for ``Color = Red``): a Blue variant would then be
+        rejected from a BOM that is otherwise perfectly valid for it.
 
-          * ``{Lens Color, Lens Material}`` — the lens lines.
-          * ``{Frame Color}`` — the frame lines.
-          * ``frozenset()`` — unrestricted (generic) lines.
+        The rule this method implements distinguishes the two by asking
+        whether the lines in each group *enumerate* across the axis:
 
-        For a PC variant the first group has zero applicable lines, so the
-        BOM is reported non-applicable and ``_bom_find`` falls through to
-        the next candidate (the Raw BOM, which does have a PC lens line).
+          * Group lines by the frozenset of attribute *ids* their
+            restrictions reference (the "axis signature"). Lines with no
+            restriction fall into the empty signature and are always
+            applicable generics.
+          * A group is treated as a **required role** only when its lines
+            collectively cover more than one distinct value of at least one
+            attribute in the signature. Enumeration across 2+ values is the
+            signal that the author intended the group to span variants, so
+            a variant with no matching line in that group is outside the
+            BOM's scope.
+          * A group whose lines all reference the same single value on every
+            axis is treated as an **optional one-off** and cannot disqualify
+            the BOM — a variant that doesn't match simply doesn't carry that
+            line.
 
-        Applicability of individual lines still delegates to Odoo's own
+        After all group checks pass, the BOM must still contribute at least
+        one line that actually applies to the variant. A BOM with zero
+        applicable lines produces an empty MO, which is exactly what this
+        module exists to avoid — so such a BOM is rejected even if every
+        group was considered optional.
+
+        Line-level applicability is delegated to Odoo's own
         ``mrp.bom.line._skip_bom_line()``, which implements the official
-        variant-matching logic and correctly handles ``always``, ``dynamic``,
-        and ``no_variant`` attribute kinds.
+        variant-matching logic (``_skip_for_no_variant``) and handles
+        ``always``, ``dynamic``, and ``no_variant`` attribute kinds.
 
         A BOM with no lines returns False so it won't silently win over a
         better candidate.
@@ -116,11 +135,37 @@ class MrpBom(models.Model):
             )
             groups[axis_signature] |= line
 
-        for lines in groups.values():
+        for signature, lines in groups.items():
+            if not signature:
+                # Unrestricted generics — always applicable, never required.
+                continue
+
+            # Determine whether this group enumerates across any axis. If
+            # every attribute in the signature is pinned to a single value
+            # across all lines in the group, the group is treated as an
+            # optional one-off and does not disqualify the BOM.
+            values_per_attribute = defaultdict(set)
+            for line in lines:
+                for ptav in line.bom_product_template_attribute_value_ids:
+                    values_per_attribute[ptav.attribute_id.id].add(ptav.id)
+
+            enumerates_multiple = any(
+                len(values) > 1 for values in values_per_attribute.values()
+            )
+            if not enumerates_multiple:
+                continue
+
             if not any(not line._skip_bom_line(product) for line in lines):
                 return False
 
-        return True
+        # Safety net: even if every required-group check passed (or every
+        # group was optional), the BOM must contribute at least one line
+        # that actually applies to the variant. Otherwise _bom_find would
+        # be returning a BOM that produces an empty MO — exactly the case
+        # this module was written to prevent.
+        return any(
+            not line._skip_bom_line(product) for line in bom.bom_line_ids
+        )
 
     def _find_fallback_bom(self, product, exclude_bom, picking_type, company_id, bom_type):
         """
