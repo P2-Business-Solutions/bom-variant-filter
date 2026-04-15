@@ -43,53 +43,70 @@ class MrpProduction(models.Model):
 
     def _compute_bom_id(self):
         """
-        Re-pick ``bom_id`` when the BOM super() kept doesn't cover the variant.
+        Re-pick ``bom_id`` when super() kept a template-level BOM that is no
+        longer the best choice for the current variant.
 
-        Odoo core's ``mrp.production._compute_bom_id`` only reassigns ``bom_id``
-        when the current BOM is empty, its ``product_tmpl_id`` no longer matches
-        the MO's template, or it is variant-specific and points at a different
-        variant. A template-level BOM (``product_id=False``) whose
-        ``product_tmpl_id`` matches is always kept — even when the user has just
-        switched to a variant the BOM can't actually build.
+        Odoo core's ``mrp.production._compute_bom_id`` only reassigns
+        ``bom_id`` when the current BOM is empty, its ``product_tmpl_id`` no
+        longer matches the MO's template, or it is variant-specific and
+        points at a different variant. A template-level BOM
+        (``product_id=False``) whose ``product_tmpl_id`` matches is always
+        kept across variant changes — regardless of whether another
+        template-level BOM on the same template is now a better fit.
 
-        That is exactly the case this module exists to fix. Consider a
-        *Precut* BOM (sequence=0) whose lens lines are all ``Lens Material =
-        Glass`` and a *Raw* BOM (sequence=1) that carries both Glass and PC
-        lens lines. When an MO is first created for a Glass variant, core's
-        ``_bom_find`` (via our override) picks the Precut BOM and assigns it.
-        When the user then edits the MO and switches the variant to a PC
-        lens, ``_compute_bom_id`` reruns but keeps the Precut BOM because it
-        is template-level and matches the template. ``_compute_move_raw_ids``
-        then re-explodes the Precut BOM for the PC variant,
-        ``_skip_bom_line`` silently drops every lens line (all Glass-only),
-        and the resulting MO is missing its lens component while still
-        referencing the wrong BOM.
+        This is exactly the case this module exists to fix, and the bug is
+        symmetric:
 
-        Our ``mrp.bom._bom_find`` override already knows how to pick the Raw
-        BOM for the PC variant — but core's compute throws that result away
-        for the "template BOM still matches" branch. We therefore let super()
-        run its normal logic, then detect the MOs whose resulting ``bom_id``
-        has no applicable lines for the current variant and rerun
-        ``_bom_find`` to swap the BOM in place. ``_compute_move_raw_ids``
-        will re-fire on the reassignment via its own ``bom_id`` dependency,
-        producing a correct component list.
+          * From Glass to PC lens. Precut BOM 1 (sequence=0) has only
+            Glass-only lens lines. The user creates the MO for a Glass
+            variant, super assigns BOM 1 via ``_bom_find``, then switches
+            the variant to PC. Super keeps BOM 1 (template-level match),
+            ``_compute_move_raw_ids`` re-explodes it, ``_skip_bom_line``
+            drops every Glass-only lens line, and the MO ends up with no
+            lens while still referencing BOM 1 — the original bug.
 
-        MOs for which no alternative BOM qualifies are left alone: downgrading
-        ``bom_id`` to ``False`` would be more disruptive than leaving the
-        broken selection visible, and the user can still fix it manually.
+          * From PC back to Glass. BOM 2 (Raw, sequence=1) carries both
+            Glass and PC lens lines, so it is perfectly applicable to a
+            Glass variant. But BOM 1 has the lower sequence and should win
+            for Glass variants. Super keeps BOM 2, and the MO sticks on the
+            lower-priority BOM across the variant switch.
+
+        Both symptoms come from super refusing to re-run ``_bom_find`` on
+        variant changes when the current BOM is template-level. We let
+        super() run its normal logic, then for every MO whose ``bom_id`` is
+        template-level (the branch where super would have kept it) we rerun
+        ``_bom_find`` and swap in whatever it returns if it differs from the
+        current selection. That covers both directions in a single rule and
+        leaves variant-specific BOMs — which super already re-evaluates on
+        variant mismatch — alone.
+
+        ``_compute_move_raw_ids`` depends on ``bom_id`` and will re-fire on
+        the reassignment, producing a correct component list. MOs for which
+        ``_bom_find`` returns an empty recordset are left alone:
+        downgrading ``bom_id`` to ``False`` would be more disruptive than
+        leaving the current selection visible, and the user can still fix
+        it manually.
         """
         super()._compute_bom_id()
 
         MrpBom = self.env['mrp.bom']
-        needs_reassignment = defaultdict(lambda: self.env['mrp.production'])
+        candidates_by_company = defaultdict(lambda: self.env['mrp.production'])
         for mo in self:
             if not mo.product_id or not mo.bom_id:
                 continue
-            if MrpBom._bom_has_applicable_lines(mo.bom_id, mo.product_id):
+            # Only second-guess super() for the "template-level BOM kept
+            # across a variant change" branch. Variant-specific BOMs
+            # (``product_id`` set) are already re-evaluated by super's own
+            # ``bom_id.product_id != production.product_id`` check, and a
+            # manually-chosen variant-specific BOM should not be silently
+            # replaced here.
+            if mo.bom_id.product_id:
                 continue
-            needs_reassignment[mo.company_id.id] |= mo
+            if mo.bom_id.product_tmpl_id != mo.product_tmpl_id:
+                continue
+            candidates_by_company[mo.company_id.id] |= mo
 
-        if not needs_reassignment:
+        if not candidates_by_company:
             return
 
         picking_type_id = self._context.get('default_picking_type_id')
@@ -98,7 +115,7 @@ class MrpProduction(models.Model):
             and self.env['stock.picking.type'].browse(picking_type_id)
         )
 
-        for company_id, productions in needs_reassignment.items():
+        for company_id, productions in candidates_by_company.items():
             boms_by_product = MrpBom.with_context(active_test=True)._bom_find(
                 productions.product_id,
                 picking_type=picking_type,
