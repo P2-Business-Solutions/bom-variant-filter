@@ -72,73 +72,46 @@ class MrpBom(models.Model):
 
     def _bom_has_applicable_lines(self, bom, product):
         """
-        Return True if at least one component line on `bom` applies to `product`.
+        Return True if at least one component line on ``bom`` applies to
+        ``product``.
 
-        Deliberately avoids _skip_bom_line() because in Odoo 18 that method
-        uses a domain condition on `raw_material_production_id` that requires
-        an active MO context. Called outside that context it silently ignores
-        the condition and returns False (not skipped) for every line, making
-        every BOM appear to have applicable lines regardless of variant filters.
-
-        Instead we check directly:
-          - If a line has no variant restrictions → it applies to all variants.
-          - If a line has variant restrictions → the product must carry all of
-            those attribute values (same logic Odoo uses internally).
+        Delegates to Odoo's own ``mrp.bom.line._skip_bom_line()``, which runs
+        the official variant-matching logic (``_skip_for_no_variant``) over
+        the line's ``bom_product_template_attribute_value_ids`` and correctly
+        handles ``always``, ``dynamic``, and ``no_variant`` attribute kinds.
+        That method is pure attribute-value comparison — it issues no search
+        and requires no MO context — so it is safe to call from ``_bom_find``.
 
         A BOM with no lines returns False so it won't silently win over a
         better candidate.
         """
         if not bom.bom_line_ids:
             return False
-
-        product_attr_values = product.product_template_attribute_value_ids
-
-        for line in bom.bom_line_ids:
-            line_restrictions = line.bom_product_template_attribute_value_ids
-            if not line_restrictions:
-                # No variant filter on this line — applies to every variant.
-                return True
-            if line_restrictions <= product_attr_values:
-                # All required attribute values are present on this product.
-                return True
-
-        return False
+        return any(
+            not line._skip_bom_line(product) for line in bom.bom_line_ids
+        )
 
     def _find_fallback_bom(self, product, exclude_bom, picking_type, company_id, bom_type):
         """
-        Search for the next-best BOM for `product`, excluding `exclude_bom`,
-        returning the first one (by sequence, then id) that has at least one
-        applicable component line.
+        Search for the next-best BOM for ``product``, excluding ``exclude_bom``,
+        returning the first one (by sequence, then variant-specific, then id)
+        that has at least one applicable component line.
+
+        Reuses ``_bom_find_domain`` so that third-party extensions of the base
+        domain (e.g. ``mrp_subcontracting``) are respected, and matches the
+        native ``_bom_find`` ordering (``sequence, product_id, id``) so that
+        variant-specific BOMs are preferred over template-level BOMs at the
+        same sequence — the same tiebreak Odoo applies for the primary pick.
         """
-        domain = [
-            ('active', '=', True),
-            ('id', '!=', exclude_bom.id),
-            # Match on template, and allow either a specific-variant BOM for
-            # this exact variant or an unspecified (template-level) BOM.
-            ('product_tmpl_id', '=', product.product_tmpl_id.id),
-            '|',
-            ('product_id', '=', product.id),
-            ('product_id', '=', False),
-        ]
+        domain = list(self._bom_find_domain(
+            product,
+            picking_type=picking_type,
+            company_id=company_id,
+            bom_type=bom_type,
+        ))
+        domain.append(('id', '!=', exclude_bom.id))
 
-        if bom_type:
-            domain += [('type', '=', bom_type)]
-
-        if picking_type:
-            domain += [
-                '|',
-                ('picking_type_id', '=', picking_type.id),
-                ('picking_type_id', '=', False),
-            ]
-
-        if company_id:
-            domain += [
-                '|',
-                ('company_id', '=', company_id),
-                ('company_id', '=', False),
-            ]
-
-        candidates = self.search(domain, order='sequence, id')
+        candidates = self.search(domain, order='sequence, product_id, id')
 
         for candidate in candidates:
             if self._bom_has_applicable_lines(candidate, product):
