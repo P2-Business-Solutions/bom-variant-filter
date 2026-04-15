@@ -1,3 +1,5 @@
+from collections import defaultdict
+
 from odoo import models, api
 import logging
 
@@ -72,24 +74,53 @@ class MrpBom(models.Model):
 
     def _bom_has_applicable_lines(self, bom, product):
         """
-        Return True if at least one component line on ``bom`` applies to
-        ``product``.
+        Return True only if the BOM covers every component "role" it defines
+        for ``product``.
 
-        Delegates to Odoo's own ``mrp.bom.line._skip_bom_line()``, which runs
-        the official variant-matching logic (``_skip_for_no_variant``) over
-        the line's ``bom_product_template_attribute_value_ids`` and correctly
-        handles ``always``, ``dynamic``, and ``no_variant`` attribute kinds.
-        That method is pure attribute-value comparison — it issues no search
-        and requires no MO context — so it is safe to call from ``_bom_find``.
+        A naive "at least one line applies" check is too permissive for BOMs
+        that mix several component roles — e.g. a *Precut* BOM that contains
+        variant-restricted lens lines (Glass only), variant-restricted frame
+        lines, and generic packaging lines. For a PC variant, the frame line
+        and the packaging lines still apply, so the naive check incorrectly
+        reports the BOM as applicable even though the BOM has no lens line
+        that fits the variant and would produce an MO missing its lens.
+
+        The real requirement is stronger: for every distinct combination of
+        attribute *axes* the BOM restricts lines on, at least one line in
+        that group must resolve for ``product``. In the example above the
+        BOM has three groups:
+
+          * ``{Lens Color, Lens Material}`` — the lens lines.
+          * ``{Frame Color}`` — the frame lines.
+          * ``frozenset()`` — unrestricted (generic) lines.
+
+        For a PC variant the first group has zero applicable lines, so the
+        BOM is reported non-applicable and ``_bom_find`` falls through to
+        the next candidate (the Raw BOM, which does have a PC lens line).
+
+        Applicability of individual lines still delegates to Odoo's own
+        ``mrp.bom.line._skip_bom_line()``, which implements the official
+        variant-matching logic and correctly handles ``always``, ``dynamic``,
+        and ``no_variant`` attribute kinds.
 
         A BOM with no lines returns False so it won't silently win over a
         better candidate.
         """
         if not bom.bom_line_ids:
             return False
-        return any(
-            not line._skip_bom_line(product) for line in bom.bom_line_ids
-        )
+
+        groups = defaultdict(lambda: self.env['mrp.bom.line'])
+        for line in bom.bom_line_ids:
+            axis_signature = frozenset(
+                line.bom_product_template_attribute_value_ids.attribute_id.ids
+            )
+            groups[axis_signature] |= line
+
+        for lines in groups.values():
+            if not any(not line._skip_bom_line(product) for line in lines):
+                return False
+
+        return True
 
     def _find_fallback_bom(self, product, exclude_bom, picking_type, company_id, bom_type):
         """
